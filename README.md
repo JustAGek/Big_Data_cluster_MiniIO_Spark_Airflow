@@ -14,18 +14,38 @@ This repository provides a local development stack for a Spark + MinIO data pipe
 
 # Deploy Your Project Locally
 
-Start the full local stack (MinIO, Spark, Postgres, Airflow) with Docker Compose:
+You can start the stack using either the convenience script or Docker Compose directly.
+
+## Option 1: Using the convenience script (recommended)
 
 ```powershell
 ./start-services.sh
 ```
 
+## Option 2: Using Docker Compose directly
+
+Start the full local stack (MinIO, Spark, Postgres, Airflow) with the main Docker Compose file:
+
+```powershell
+docker-compose -f docker-compose.yml up -d
+```
+
+Or use the MinIO and Spark specific setup:
+
+```powershell
+docker-compose -f docker-compose.minio-spark.yml up -d
+```
+
 This will build and start the following services:
 
-- MinIO (object storage) — ports: 9000 (API), 9001 (Console)
-- Spark Master & Worker(s) — master ports: 7077 (RPC), 8088 (UI) and worker UI on 8089
-- Postgres — used by Airflow
-- Airflow Webserver & Scheduler — Airflow UI at http://localhost:8080 (default admin/admin created)
+| Service                    | Status     | Port      | URL                             |
+| -------------------------- | ---------- | --------- | ------------------------------- |
+| **Airflow Webserver**      | ✅ Running | 8080      | http://localhost:8080           |
+| **Airflow Scheduler**      | ✅ Running | -         | Internal                        |
+| **MinIO (Object Storage)** | ✅ Healthy | 9000/9001 | http://localhost:9001 (Console) |
+| **Spark Master**           | ✅ Healthy | 7077/8088 | http://localhost:8088           |
+| **Spark Worker**           | ✅ Running | 8089      | http://localhost:8089           |
+| **PostgreSQL**             | ✅ Running | 5432      | Internal                        |
 
 To stop and remove the services:
 
