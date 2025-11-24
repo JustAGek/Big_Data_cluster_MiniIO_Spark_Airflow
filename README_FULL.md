@@ -1,171 +1,1031 @@
-# afsparkmini — Local Airflow + Spark + MinIO development stack
+# Big Data Cluster: Financial Fraud Detection Pipeline
 
-This repository provides a self-contained local development stack for building and testing a Spark-based data pipeline backed by S3-compatible object storage (MinIO) and orchestrated by Apache Airflow. It was created to run the scalable financial fraud detection proof-of-concept used in the project proposal.
+## Complete Developer Guide
 
-This README documents the full developer workflow: what services run, how to start/stop them, where to put the PaySim CSV files, how to upload them into MinIO, how to run the smoke tests, and common troubleshooting tips.
-
-Contents
-- `dags/` — Airflow DAGs (including smoke and Spark submission DAGs).
-- `spark/` — Docker context for building Spark images used by the compose stack.
-- `spark-jobs/` — PySpark jobs (e.g., `process_data.py`).
-- `include/` — helper scripts and utilities (e.g., `upload_test_data.py`).
-- `data/paysim/raw/` — (local) place for PaySim CSV files (created for you).
-- `docker-compose.yml` — compose file that runs MinIO, Spark, Postgres, and Airflow locally.
-- `start-services.sh` / `stop-services.sh` — convenience scripts to start/stop the stack.
-
-Quick architecture summary
-- Airflow (Webserver + Scheduler) manages DAGs and triggers spark-submits.
-- MinIO acts as the S3-compatible object store for raw/processed data (Datalake).
-- Spark master & workers run PySpark jobs that read/write data from/to MinIO via the S3A connector.
-- Postgres is the Airflow metadata DB.
-
-Service ports (container vs host mapping)
-- Container internal ports (container-to-container):
-  - MinIO API: `9000` (container), MinIO Console: `9001` (container)
-  - Spark Master RPC: `7077`, Spark Master UI: `8088`, Spark Worker UI: `8089`
-  - Airflow Webserver: `8080`, Postgres: `5432`
-- Host ports (this repo maps MinIO to unusual host ports to avoid conflicts):
-  - Airflow UI: http://localhost:8080
-  - MinIO Console (host-mapped): http://localhost:19000  (API endpoint: http://localhost:19000)
-  - Spark Master UI: http://localhost:8088
-  - Spark Master RPC: spark://localhost:7077
-
-Prerequisites
-- Docker (Desktop) installed and running.
-- docker-compose (v1 or v2; your Docker Desktop typically includes it).
-- Python 3.8+ available on the host if you want to run the helper upload scripts or tests locally.
-
-Where to put the PaySim CSV files (you asked)
-- Local directory (created for you):
-
-  `C:\Users\JustAGeek\Desktop\New folder\SIC_Graduation\afsparkmini\data\paysim\raw`
-
-- Recommended naming conventions (the project pipeline expects daily splits):
-  - `paysim_day_01.csv`, `paysim_day_02.csv`, …, `paysim_day_30.csv`
-  - or a single file `paysim_full.csv` if you prefer one-file ingestion first.
-
-How to start the entire stack (PowerShell)
-1. From the repository root (Windows PowerShell):
-
-```powershell
-# Start services in detached mode
-docker-compose up -d --build
-
-# Wait a short while for services to initialize, then check status
-docker-compose ps
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-```
-
-2. Access UIs (host):
-- Airflow UI: http://localhost:8080
-- MinIO Console: http://localhost:19000 (or check `docker ps` for the mapped host port)
-- Spark Master UI: http://localhost:8088
-
-Stopping the stack (PowerShell)
-
-```powershell
-docker-compose down --volumes --remove-orphans
-```
-
-Uploading PaySim CSVs into MinIO
-- The DAGs read from MinIO (`s3a://input-bucket`) so files must be uploaded to the `input-bucket` in MinIO for the pipeline to process them.
-- There is a helper script at `include/upload_test_data.py`. It contains `get_minio_client()` and upload helper functions. By default the helper expects the MinIO endpoint available at `http://minio:9000` (container network). When running from your host you should point it to the host-mapped port `http://localhost:19000`.
-
-Example — upload one file from PowerShell (adjust path and filename):
-
-```powershell
-$env:MINIO_ENDPOINT = "http://localhost:19000"
-$env:MINIO_ACCESS_KEY = "minioadmin"
-$env:MINIO_SECRET_KEY = "minioadmin"
-
-python - <<'PY'
-from include.upload_test_data import get_minio_client
-client = get_minio_client()
-bucket = 'input-bucket'
-try:
-    client.create_bucket(Bucket=bucket)
-except Exception:
-    pass
-path = r"data\\paysim\\raw\\paysim_day_01.csv"  # change to your file
-with open(path, 'rb') as f:
-    client.put_object(Bucket=bucket, Key='paysim_day_01.csv', Body=f)
-print('Uploaded paysim_day_01.csv to input-bucket')
-PY
-```
-
-Tip: I can add a small CLI script `tools/upload_paysim.py` to bulk-upload everything under `data/paysim/raw` with one command — tell me if you want that.
-
-Running the smoke test (pytest)
-- Tests live in `tests/`. To run the smoke integration test that triggers the sample DAG:
-
-```powershell
-python -m pytest -q tests/test_smoke_workflow.py::test_smoke_pipeline_completes
-```
-
-The smoke test exercises the pipeline end-to-end: it uploads a sample file to MinIO, triggers the DAG via Airflow's REST API, waits for completion and asserts expected artifacts.
-
-Common troubleshooting
-- Airflow DAG import errors:
-  - If the scheduler shows DAG parse/import exceptions, check your DAG files in `dags/` for provider-specific imports. Some DAGs include defensive try/except imports — this pattern is recommended when running in many environments.
-  - When you change DAGs, delete Python bytecode caches inside the container to force recompilation: remove `/opt/airflow/dags/__pycache__` in the Airflow container or restart the scheduler.
-
-- Airflow REST API 401 Unauthorized:
-  - The compose environment enables basic auth via `AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth`. Use your configured username/password when calling the REST API.
-
-- Spark S3A NumberFormatException ("For input string: \"60s\""):
-  - This repository encountered a Hadoop/S3A configuration problem where unit-suffixed values (e.g. "60s") were present in defaults and caused a Java NumberFormatException. Workarounds implemented here:
-    1. The DAGs pass numeric overrides to `spark-submit` using `--conf spark.hadoop.fs.s3a.socket.timeout=60000` (milliseconds) and related keys.
-    2. The Spark job (`spark-jobs/process_data.py`) also sets the numeric configs on the SparkSession to ensure values are numeric.
-  - If you see the `NumberFormatException` on startup, add numeric `spark.hadoop.fs.s3a.*` configs (milliseconds or integer counts) to both the DAG `spark-submit` and the SparkSession builder.
-
-- MinIO connectivity from host vs container:
-  - Inside containers use `http://minio:9000`.
-  - From host use `http://localhost:19000` (or the host port `docker ps` shows).
-
-Developer notes & extension points
-- To make the S3A numeric-workaround permanent, you can bake `core-site.xml` with the correct numeric values into the Spark image (`spark/Dockerfile`). This avoids passing overrides repeatedly at runtime.
-- To add new DAGs, put them in `dags/` and follow the defensive import pattern for optional providers:
-
-```python
-try:
-    from airflow.providers.amazon.aws.operators.sagemaker import SageMakerCreateTrainingJobOperator
-except Exception:
-    SageMakerCreateTrainingJobOperator = None
-```
-
-- The Spark jobs are in `spark-jobs/`. Use `spark-submit` arguments in the DAGs — the DAGs already include recommended `--conf` overrides for S3A timeouts and retries.
-
-Useful commands (PowerShell)
-
-```powershell
-# Show compose services and their status
-docker-compose ps
-
-# Show running containers with ports
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-
-# View Airflow logs (container)
-docker-compose logs -f airflow-scheduler
-
-# Execute spark-submit from inside the spark-master container (example)
-docker exec -it spark-master /bin/bash
-# then run spark-submit inside container where spark, hadoop classpath and credentials are available
-```
-
-Contact / support
-- If you find issues, please open an issue in this repo describing the error and include relevant container logs (`docker-compose logs <service>`).
-
-License
-- This repository is provided as-is for learning and prototyping. Adapt and reuse as needed.
-
-Acknowledgements
-- The stack is assembled to simulate a cloud-native lakehouse locally using MinIO and Spark and is intended for the Samsung Innovation Campus project described in the proposal.
+**Project**: Samsung Innovation Campus (SIC) Graduation Project  
+**Focus**: Financial fraud detection using Apache Spark, MinIO, and Airflow  
+**Last Updated**: November 2025
 
 ---
 
-If you want, I can also:
-- add a `tools/upload_paysim.py` script to bulk-upload files from `data/paysim/raw` into MinIO, and/or
-- add a small CI job or script to run the smoke tests with a single command, and/or
-- bake the numeric S3A overrides into the Spark image by adding a `core-site.xml` into `spark/` and rebuilding the Spark image.
+## Table of Contents
 
-Tell me which extras you'd like and I'll implement them next.
+1. [Project Overview](#project-overview)
+2. [Architecture](#architecture)
+3. [Prerequisites](#prerequisites)
+4. [Quick Start](#quick-start)
+5. [System Architecture & Components](#system-architecture--components)
+6. [Configuration](#configuration)
+7. [Running Pipelines](#running-pipelines)
+8. [Data Flow](#data-flow)
+9. [Monitoring & Troubleshooting](#monitoring--troubleshooting)
+10. [Development Guide](#development-guide)
+11. [Performance Tuning](#performance-tuning)
+12. [Production Deployment](#production-deployment)
+
+---
+
+## Project Overview
+
+This repository implements a **financial fraud detection system** using:
+
+- **Apache Airflow**: Workflow orchestration and scheduling
+- **Apache Spark**: Distributed data processing and analytics
+- **MinIO**: S3-compatible object storage for datalake
+- **PostgreSQL**: Airflow metadata database
+- **Snowflake**: Cloud data warehouse for final processed data (optional)
+
+### Key Features
+
+✅ **Local Development Stack**: Fully containerized for easy local development  
+✅ **End-to-End Pipeline**: Data ingestion → transformation → analytics  
+✅ **Fraud Detection**: ML-ready feature engineering on PaySim transaction data  
+✅ **Scalable**: Auto-scale Spark workers as needed  
+✅ **Production-Ready**: Includes error handling, retries, and comprehensive logging
+
+---
+
+## Architecture
+
+### High-Level System Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     EXTERNAL DATA SOURCES                       │
+│              (PaySim CSVs, Other Transaction Feeds)             │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 AIRFLOW ORCHESTRATION LAYER                     │
+│                    (Airflow Scheduler)                          │
+│           DAG: fintech_fraud_pipeline_v4                        │
+└─────┬──────────────────────────────────────────────────────┬────┘
+      │                                                      │
+      ▼ (Task 1)                                   (Task 2) ▼
+┌─────────────────────┐                      ┌──────────────────────┐
+│  INGEST_TO_MINIO    │                      │ PROCESS_WITH_SPARK   │
+│ (Python Operator)   │                      │(SparkSubmitOperator) │
+│                     │                      │                      │
+│ Upload CSV to      ├─────────────────────>│ Read S3A → Transform │
+│ MinIO raw-data     │                      │ → Write to Snowflake │
+│ bucket             │                      │                      │
+└─────────────────────┘                      └──────────────────────┘
+      │                                                 │
+      ▼                                                 ▼
+┌────────────────────┐                      ┌──────────────────────┐
+│     MinIO          │                      │   Spark Cluster      │
+│   (Storage)        │                      │ Master + Workers     │
+│                    │                      │                      │
+│ input: raw-data    │◄─────────────────────┤ (Distributed Compute)│
+│ output: (for later)│                      │                      │
+└────────────────────┘                      └──────────────────────┘
+      │                                                 │
+      │                                                 ▼
+      │                                      ┌──────────────────────┐
+      │                                      │     Snowflake DW     │
+      │                                      │                      │
+      │                                      │ Table:               │
+      │                                      │ FACT_TRANSACTIONS    │
+      └──────────────────────────────────────┤                      │
+         (Optional: Archive to processed)    │ (Optional Connection)│
+                                             └──────────────────────┘
+```
+
+### Data Flow
+
+```
+RAW DATA
+  ↓
+/include/data/paysim/raw/paysim_day*.csv
+  ↓
+Python Operator (upload_to_minio)
+  ↓
+MinIO: s3a://raw-data/paysim_day*.csv
+  ↓
+Spark Job (process_fraud_data.py)
+  ├─ Read CSV from MinIO
+  ├─ Transform:
+  │  ├─ Generate unique transaction ID (MD5 hash)
+  │  ├─ Add ingestion timestamp
+  │  ├─ Cast data types (amounts to double, step to int, etc.)
+  │  └─ Rename columns to uppercase
+  ├─ Feature engineering:
+  │  ├─ Balance changes
+  │  ├─ Fraud indicators
+  │  └─ Transaction metadata
+  └─ Write to Snowflake
+      ↓
+FACT_TRANSACTIONS table (Snowflake)
+```
+
+---
+
+## Prerequisites
+
+### System Requirements
+
+- **Docker Desktop** or Docker Engine (v20.10+)
+- **Docker Compose** (v1.29+ or v2.0+)
+- **Git** (for cloning the repository)
+- **Python 3.8+** (optional, for local testing)
+- **4GB+ RAM** (recommended for Docker allocation)
+- **20GB+ disk space** (for images and volumes)
+
+### Software to Install
+
+```powershell
+# Verify Docker and Compose are installed
+docker --version      # Docker 20.10+
+docker-compose --version  # 1.29+ or 2.0+
+
+# For local testing (optional)
+python --version      # 3.8+
+pip install pytest requests
+```
+
+---
+
+## Quick Start
+
+### 1. Clone and Navigate to Project
+
+```powershell
+cd "Big_Data_cluster_MiniIO_Spark_Airflow"
+```
+
+### 2. Start the Stack
+
+```powershell
+# Start all services (MinIO, Spark, Airflow, Postgres)
+./start-services.sh
+
+# Wait for initialization (30-60 seconds)
+sleep 30
+
+# Verify all services are running
+docker-compose ps
+```
+
+### 3. Access the UIs
+
+Open your browser and navigate to:
+
+| Service          | URL                   | Login                       |
+| ---------------- | --------------------- | --------------------------- |
+| **Airflow**      | http://localhost:8080 | `admin` / `admin`           |
+| **MinIO**        | http://localhost:9001 | `minioadmin` / `minioadmin` |
+| **Spark Master** | http://localhost:8088 | -                           |
+
+### 4. Run the Pipeline
+
+1. **Open Airflow UI** → http://localhost:8080
+2. **Find DAG**: `fintech_fraud_pipeline_v4`
+3. **Enable DAG**: Toggle the switch to ON
+4. **Trigger**: Click the ▶️ button to run manually
+5. **Monitor**: Click on the DAG run to see task progress
+
+### 5. Stop the Stack
+
+```powershell
+./stop-services.sh
+```
+
+---
+
+## System Architecture & Components
+
+### Services Breakdown
+
+#### 1. Airflow (Orchestration)
+
+**Role**: Schedules and monitors data pipelines
+
+**Containers**:
+
+- `airflow-webserver`: Web UI (port 8080)
+- `airflow-scheduler`: Task scheduler and executor
+- `airflow-init`: One-time initialization
+
+**Configuration**:
+
+- Executor: LocalExecutor (single-machine execution)
+- Database: PostgreSQL (metadata storage)
+- Connections: Pre-configured for Spark and MinIO
+
+**Key Files**:
+
+- `airflow/Dockerfile`: Custom Airflow image
+- `airflow/requirements.txt`: Python dependencies
+- `airflow/load_connections.sh`: Connection setup script
+- `dags/fraud_pipeline_dag.py`: Main pipeline definition
+
+#### 2. Spark (Distributed Processing)
+
+**Role**: Large-scale data transformation and analytics
+
+**Containers**:
+
+- `spark-master`: Master node (port 7077 RPC, 8088 UI)
+- `spark-worker`: Worker nodes (port 8089+ UI)
+
+**Configuration**:
+
+- 2 cores per worker
+- 2GB memory per worker
+- Scalable via `--scale spark-worker=N`
+
+**Key Files**:
+
+- `spark/Dockerfile`: Spark runtime image
+- `spark-jobs/process_fraud_data.py`: ETL job
+
+#### 3. MinIO (Object Storage)
+
+**Role**: S3-compatible data datalake
+
+**Container**: `minio` (port 9000 API, 9001 Console)
+
+**Buckets**:
+
+- `raw-data`: Input CSV files
+- `input-bucket`: Legacy bucket (may be deprecated)
+- `output-bucket`: Legacy output
+- `processed-data`: Processed results
+
+**Credentials**: `minioadmin` / `minioadmin`
+
+#### 4. PostgreSQL (Metadata Database)
+
+**Role**: Airflow state and DAG metadata
+
+**Container**: `postgres` (port 5432, internal only)
+
+**Database**: `airflow` (created automatically)
+
+---
+
+## Configuration
+
+### Environment Variables (.env file)
+
+Create a `.env` file in the project root with the following variables:
+
+```env
+# MinIO Configuration
+MINIO_PORT=9000
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=minioadmin
+MINIO_HOST=minio
+
+# Spark Configuration
+SPARK_MASTER_HOST=spark-master
+SPARK_MASTER_PORT=7077
+SPARK_MASTER_WEBUI_PORT=8088
+SPARK_WORKER_CORES=2
+SPARK_WORKER_MEMORY=2g
+SPARK_WORKER_PORT=7078
+SPARK_WORKER_WEBUI_PORT=8089
+
+# PostgreSQL Configuration
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=airflow123
+POSTGRES_DB=airflow
+
+# Airflow Configuration
+AIRFLOW__CORE__EXECUTOR=LocalExecutor
+AIRFLOW__CORE__FERNET_KEY=your_fernet_key_here
+AIRFLOW__WEBSERVER__WORKERS=2
+AIRFLOW_FERNET_KEY=your_fernet_key_here
+
+# Snowflake Configuration (Optional)
+SNOWFLAKE_USER=your_sf_user
+SNOWFLAKE_PASSWORD=your_sf_password
+SNOWFLAKE_ACCOUNT=your_account_id
+SNOWFLAKE_DB=FRAUD_DETECTION
+SNOWFLAKE_SCHEMA=FRAUD_DETECTION
+SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+SNOWFLAKE_ROLE=ACCOUNTADMIN
+```
+
+### Docker Compose Configuration
+
+**File**: `docker-compose.yml`
+
+Key services and their configurations:
+
+```yaml
+minio:
+  - S3-compatible storage
+  - Volumes: minio-data (persistent)
+  - Buckets auto-created by minio-init service
+
+spark-master:
+  - Spark cluster leader
+  - Ports: 7077 (RPC), 8088 (Web UI)
+
+spark-worker:
+  - Spark compute nodes (scalable)
+  - Ports: 8089 (Web UI), 7078 (RPC)
+
+postgres:
+  - Airflow metadata DB
+  - Volumes: pgdata (persistent)
+
+airflow-init:
+  - One-time setup: DB upgrade, create admin user, load connections
+  - Must complete before webserver/scheduler starts
+
+airflow-webserver:
+  - Web UI for DAG management
+  - Port: 8080
+
+airflow-scheduler:
+  - Task scheduling and monitoring
+  - Runs DAGs on schedule or manual trigger
+```
+
+---
+
+## Running Pipelines
+
+### DAG: fintech_fraud_pipeline_v4
+
+**Purpose**: End-to-end fraud detection pipeline
+
+**Schedule**: `@daily` (daily at 00:00 UTC) or manual trigger
+
+**Tasks**:
+
+#### Task 1: ingest_to_minio
+
+```python
+PythonOperator
+├─ Reads PaySim CSV from: /opt/airflow/include/data/paysim/raw/
+├─ Connects to MinIO via boto3 (http://minio:9000)
+├─ Uploads file to bucket: raw-data
+└─ Expected duration: < 1 minute
+```
+
+**Code Location**: `dags/fraud_pipeline_dag.py` (function: `upload_to_minio`)
+
+**Inputs**:
+
+- CSV file path: `/opt/airflow/include/data/paysim/raw/paysim_day{N}.csv`
+- MinIO endpoint: `http://minio:9000`
+- Credentials: `minioadmin`/`minioadmin`
+
+**Outputs**:
+
+- File in MinIO: `s3a://raw-data/paysim_day{N}.csv`
+
+#### Task 2: process_with_spark
+
+```python
+SparkSubmitOperator
+├─ Submits Spark job to Spark Master
+├─ Job: process_fraud_data.py
+├─ Reads from MinIO (S3A)
+├─ Transforms data
+└─ Writes to Snowflake (if configured)
+```
+
+**Code Location**: `spark-jobs/process_fraud_data.py`
+
+**Transformations**:
+
+- Generate unique transaction ID via MD5 hash
+- Add ingestion timestamp
+- Cast data types (numeric fields to double/int)
+- Rename columns to uppercase
+- Derive features (balance changes, fraud flags)
+
+**Output**:
+
+- Snowflake table: `FACT_TRANSACTIONS`
+- Columns: TRANS_ID, STEP, TYPE, AMOUNT, NAME_ORIG, etc.
+
+### Manually Trigger a DAG Run
+
+**Via Airflow UI**:
+
+1. Go to http://localhost:8080
+2. Click on `fintech_fraud_pipeline_v4`
+3. Click the ▶️ "Trigger DAG" button
+4. (Optional) Set run ID or parameters
+
+**Via Airflow REST API**:
+
+```powershell
+$dag_id = "fintech_fraud_pipeline_v4"
+$run_id = "manual_run_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+curl -X POST `
+  -H "Content-Type: application/json" `
+  -d "{`"dag_run_id`": `"$run_id`"}" `
+  -u admin:admin `
+  "http://localhost:8080/api/v1/dags/$dag_id/dagRuns"
+```
+
+### Monitor DAG Execution
+
+1. **Airflow UI**: Watch task status change from `queued` → `running` → `success`
+2. **Task Logs**: Click a task to view detailed logs
+3. **Spark Master UI**: http://localhost:8088 to see Spark jobs
+4. **Container Logs**:
+
+```powershell
+# Airflow Scheduler logs
+docker-compose logs -f airflow-scheduler
+
+# Spark Master logs
+docker-compose logs -f spark-master
+
+# Spark Worker logs
+docker-compose logs -f spark-worker
+
+# MinIO logs
+docker-compose logs -f minio
+```
+
+---
+
+## Data Flow
+
+### Step-by-Step Data Journey
+
+#### 1. Data Preparation (Local or External)
+
+**Source**: PaySim dataset (CSV format)
+
+**Location**: Place files in `include/data/paysim/raw/`
+
+**File Format**:
+
+```csv
+step,type,amount,nameOrig,oldbalanceOrg,newbalanceOrig,nameDest,oldbalanceDest,newbalanceDest,isFraud,isFlaggedFraud
+1,CASH_OUT,100.0,C1,500.0,400.0,C2,1000.0,1100.0,0,0
+2,TRANSFER,50.0,C1,400.0,350.0,C3,500.0,550.0,1,0
+```
+
+#### 2. Ingestion Phase (Airflow Task 1)
+
+**Actor**: `ingest_to_minio` (PythonOperator)
+
+**Steps**:
+
+1. Airflow reads the file from `/opt/airflow/include/data/paysim/raw/paysim_day1.csv`
+2. Creates boto3 S3 client pointing to MinIO (`http://minio:9000`)
+3. Uploads file to MinIO bucket `raw-data` with same filename
+4. Returns success/failure status
+
+**Error Handling**:
+
+- File not found → Raises `FileNotFoundError`
+- MinIO connection error → Raises exception with details
+- Airflow retries logic configured: 0 retries (can be modified)
+
+#### 3. Processing Phase (Spark Job)
+
+**Actor**: `process_with_spark` (SparkSubmitOperator)
+
+**Steps**:
+
+1. Spark reads file from `s3a://raw-data/paysim_day1.csv` via S3A connector
+2. Parses CSV with header and schema inference
+3. Applies transformations:
+   - Generate MD5 hash for TRANS_ID from step + nameOrig + amount
+   - Add INGESTION_TIMESTAMP (current_timestamp)
+   - Cast numeric columns to proper types
+   - Rename columns to uppercase
+4. Writes to Snowflake FACT_TRANSACTIONS table (append mode)
+
+**Spark Configuration**:
+
+```python
+spark.hadoop.fs.s3a.endpoint = http://minio:9000
+spark.hadoop.fs.s3a.access.key = minioadmin
+spark.hadoop.fs.s3a.secret.key = minioadmin
+spark.hadoop.fs.s3a.path.style.access = true
+spark.hadoop.fs.s3a.impl = org.apache.hadoop.fs.s3a.S3AFileSystem
+spark.hadoop.fs.s3a.connection.ssl.enabled = false
+```
+
+#### 4. Storage Phase
+
+**MinIO** (S3A):
+
+- File remains in `raw-data/paysim_day1.csv`
+
+**Snowflake** (if configured):
+
+- Data inserted into `FRAUD_DETECTION.FRAUD_DETECTION.FACT_TRANSACTIONS`
+
+---
+
+## Monitoring & Troubleshooting
+
+### Monitoring Tools
+
+#### 1. Airflow Web UI
+
+- **URL**: http://localhost:8080
+- **Shows**: DAGs, task status, logs, metrics
+- **Key Views**:
+  - Graph View: Visual task dependencies
+  - Tree View: Historical runs
+  - Task Logs: Detailed execution output
+
+#### 2. Spark Master UI
+
+- **URL**: http://localhost:8088
+- **Shows**: Running/completed applications, executors, stage details
+- **Key Sections**:
+  - Running Applications
+  - Completed Applications
+  - Executors (task capacity)
+  - Stages (performance metrics)
+
+#### 3. MinIO Console
+
+- **URL**: http://localhost:9001
+- **Shows**: Buckets, objects, access logs
+- **Can**: Upload/download files, manage buckets, set policies
+
+#### 4. Docker Logs
+
+```powershell
+# All services
+docker-compose logs -f
+
+# Specific service
+docker-compose logs -f airflow-scheduler
+docker-compose logs -f spark-master
+docker-compose logs -f minio
+
+# Last N lines
+docker-compose logs --tail=50 airflow-webserver
+```
+
+### Common Issues & Solutions
+
+#### Issue 1: Airflow DAG Not Appearing
+
+**Symptoms**: DAG not visible in Airflow UI after `./start-services.sh`
+
+**Solutions**:
+
+1. Check if `airflow-init` completed successfully:
+
+   ```powershell
+   docker-compose logs airflow-init
+   ```
+
+2. Restart the scheduler:
+
+   ```powershell
+   docker-compose restart airflow-scheduler
+   ```
+
+3. Check DAG file syntax:
+   ```powershell
+   docker exec airflow-webserver python -m py_compile /opt/airflow/dags/fraud_pipeline_dag.py
+   ```
+
+#### Issue 2: Spark Job Fails with S3A Connection Error
+
+**Symptoms**: `java.lang.NumberFormatException` or connection timeout
+
+**Solutions**:
+
+1. Verify MinIO is running:
+
+   ```powershell
+   docker-compose ps minio
+   curl http://localhost:9000/minio/health/live
+   ```
+
+2. Check Spark configuration in DAG:
+
+   - Socket timeout should be numeric (milliseconds)
+   - Path style access enabled
+   - SSL disabled (for local MinIO)
+
+3. View Spark logs:
+   ```powershell
+   docker logs spark-master
+   docker logs spark-worker
+   ```
+
+#### Issue 3: Task Fails - File Not Found at `/opt/airflow/include/data/paysim/raw/`
+
+**Symptoms**: `FileNotFoundError` during ingest task
+
+**Solutions**:
+
+1. Place PaySim CSV in the correct location (host):
+
+   ```powershell
+   ls include/data/paysim/raw/  # Should show paysim_day*.csv
+   ```
+
+2. Verify the file was mounted into Airflow container:
+
+   ```powershell
+   docker exec airflow-webserver ls /opt/airflow/include/data/paysim/raw/
+   ```
+
+3. Check docker-compose.yml volume mount for Airflow services
+
+#### Issue 4: Snowflake Connection Failed
+
+**Symptoms**: Spark job completes but Snowflake write fails
+
+**Solutions**:
+
+1. Verify Snowflake credentials in `.env`:
+
+   ```powershell
+   echo $env:SNOWFLAKE_ACCOUNT, $env:SNOWFLAKE_USER
+   ```
+
+2. Check Snowflake is accessible:
+
+   - URL format: `https://{account}.snowflakecomputing.com`
+   - Test connection manually
+
+3. Verify warehouse is running in Snowflake console
+
+4. View Spark error logs:
+   ```powershell
+   docker logs spark-master | grep -i snowflake
+   ```
+
+#### Issue 5: Out of Memory or Cluster Performance Issues
+
+**Symptoms**: Tasks timeout, containers crash, slow processing
+
+**Solutions**:
+
+1. Check Docker memory allocation:
+
+   ```powershell
+   docker stats
+   ```
+
+2. Increase worker resources in `.env`:
+
+   ```env
+   SPARK_WORKER_CORES=4      # Increase from 2
+   SPARK_WORKER_MEMORY=4g    # Increase from 2g
+   ```
+
+3. Rebuild and restart:
+
+   ```powershell
+   docker-compose down -v
+   docker-compose up -d --build
+   ```
+
+4. Or add more workers:
+   ```powershell
+   docker-compose up -d --scale spark-worker=3
+   ```
+
+---
+
+## Development Guide
+
+### Adding a New DAG
+
+**Example**: Create a new pipeline for additional data sources
+
+```python
+# dags/my_new_pipeline.py
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'airflow',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'start_date': datetime(2025, 1, 1),
+}
+
+with DAG(
+    'my_custom_pipeline',
+    default_args=default_args,
+    schedule_interval='0 2 * * *',  # Daily at 2 AM
+    catchup=False,
+) as dag:
+
+    # Task 1: Extract
+    extract_task = PythonOperator(
+        task_id='extract_data',
+        python_callable=my_extract_function,
+    )
+
+    # Task 2: Transform (Spark)
+    transform_task = SparkSubmitOperator(
+        task_id='transform_data',
+        conn_id='spark_default',
+        application='/opt/spark-jobs/my_transform.py',
+        verbose=True
+    )
+
+    extract_task >> transform_task
+```
+
+**Steps**:
+
+1. Create `dags/my_new_pipeline.py`
+2. Define DAG with unique `dag_id`
+3. Add tasks (Python operators, Spark operators, etc.)
+4. Define task dependencies with `>>`
+5. Airflow auto-discovers the DAG (no restart needed)
+
+### Creating a New Spark Job
+
+**Example**: Custom data transformation
+
+```python
+# spark-jobs/my_transform.py
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, current_timestamp
+
+def main():
+    spark = SparkSession.builder \
+        .appName("MyTransform") \
+        .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
+        .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+        .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
+        .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+        .getOrCreate()
+
+    # Read from MinIO
+    df = spark.read.csv("s3a://raw-data/myfile.csv", header=True)
+
+    # Transform
+    df_transformed = df \
+        .withColumn("processing_date", current_timestamp()) \
+        .filter(col("amount") > 0)
+
+    # Write to MinIO or Snowflake
+    df_transformed.write \
+        .csv("s3a://processed-data/output", mode="overwrite", header=True)
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+```
+
+### Testing Locally
+
+**Run Integration Tests**:
+
+```powershell
+# Ensure stack is running
+./start-services.sh
+
+# Run smoke tests
+python -m pytest tests/test_smoke_workflow.py -v
+
+# Run specific test
+python -m pytest tests/test_smoke_workflow.py::test_smoke_pipeline_completes -v
+```
+
+**What the Smoke Test Does**:
+
+1. Triggers the `smoke_test_pipeline` DAG
+2. Waits for completion (default 300 seconds)
+3. Verifies all tasks succeeded
+4. Reports any failures
+
+---
+
+## Performance Tuning
+
+### Spark Optimization
+
+#### 1. Increase Parallelism
+
+```python
+spark.conf.set("spark.sql.shuffle.partitions", 200)
+spark.conf.set("spark.default.parallelism", 200)
+```
+
+#### 2. Tune Executor Resources
+
+In `.env`:
+
+```env
+SPARK_EXECUTOR_CORES=4
+SPARK_EXECUTOR_MEMORY=4g
+SPARK_DRIVER_MEMORY=2g
+```
+
+#### 3. Optimize S3A Access
+
+```python
+spark.config("spark.hadoop.fs.s3a.block.size", "128M")
+spark.config("spark.hadoop.fs.s3a.threads.max", "100")
+spark.config("spark.hadoop.fs.s3a.connection.establish.timeout", "50000")
+```
+
+### MinIO Optimization
+
+#### 1. Increase Concurrent Requests
+
+```yaml
+environment:
+  MINIO_API_CORS_ALLOW_ORIGIN: "*"
+  MINIO_STORAGE_CLASS_STANDARD: "EC:3"
+```
+
+#### 2. Monitor Storage Usage
+
+```powershell
+docker exec minio mc du minio/raw-data
+```
+
+### Airflow Optimization
+
+#### 1. Increase Webserver Workers
+
+In `.env`:
+
+```env
+AIRFLOW__WEBSERVER__WORKERS=4
+```
+
+#### 2. Configure DAG Parsing
+
+```env
+AIRFLOW__CORE__PARALLELISM=32
+AIRFLOW__CORE__DAG_CONCURRENCY=16
+```
+
+---
+
+## Production Deployment
+
+### Pre-Production Checklist
+
+- [ ] Snowflake credentials configured and tested
+- [ ] Data validation rules implemented
+- [ ] Error alerting configured (email notifications)
+- [ ] Backup strategy for MinIO data
+- [ ] Resource limits set appropriately
+- [ ] Monitoring and logging enabled
+- [ ] Security review complete (credentials, network)
+
+### Deployment Steps
+
+1. **Deploy on Cloud VM**:
+
+   - Install Docker and Docker Compose
+   - Clone repository
+   - Configure `.env` with production credentials
+
+2. **Use Managed Services** (Recommended):
+
+   - Replace local Airflow with cloud Airflow (AWS MWAA, GCP Cloud Composer)
+   - Replace MinIO with cloud storage (AWS S3, GCS)
+   - Use cloud data warehouse (Snowflake, BigQuery, Redshift)
+
+3. **Security Hardening**:
+
+   - Use Docker secrets for credentials
+   - Enable TLS for all services
+   - Configure network policies
+   - Implement access controls
+
+4. **Monitoring**:
+   - Set up Prometheus + Grafana
+   - Configure alerting thresholds
+   - Log aggregation (ELK stack)
+   - APM tools for Spark
+
+---
+
+## Useful Commands
+
+### Docker Compose Commands
+
+```powershell
+# Start stack
+docker-compose up -d --build
+
+# View status
+docker-compose ps
+
+# View logs (all)
+docker-compose logs -f
+
+# View logs (specific service, last 50 lines)
+docker-compose logs --tail=50 -f airflow-scheduler
+
+# Stop stack
+docker-compose down
+
+# Stop and remove volumes
+docker-compose down -v
+
+# Scale workers
+docker-compose up -d --scale spark-worker=3
+
+# Restart specific service
+docker-compose restart spark-master
+```
+
+### Airflow Commands (inside container)
+
+```powershell
+# Access Airflow container
+docker exec -it airflow-webserver bash
+
+# Inside container:
+# List DAGs
+airflow dags list
+
+# Trigger DAG
+airflow dags trigger fintech_fraud_pipeline_v4
+
+# View task logs
+airflow tasks logs fintech_fraud_pipeline_v4 ingest_to_minio <run_id>
+
+# Test DAG syntax
+airflow dags test fintech_fraud_pipeline_v4
+
+# View connections
+airflow connections list
+```
+
+### Spark Commands (inside container)
+
+```powershell
+# Access Spark Master
+docker exec -it spark-master bash
+
+# Inside container:
+# Submit job
+spark-submit --master spark://spark-master:7077 /opt/spark-jobs/process_fraud_data.py
+
+# View Spark logs
+tail -f /opt/spark/logs/spark*.log
+```
+
+### MinIO Commands (inside container)
+
+```powershell
+# Access MinIO init container
+docker exec -it minio-init bash
+
+# Inside container (using mc CLI):
+# List buckets
+mc ls minio/
+
+# List bucket contents
+mc ls minio/raw-data
+
+# Upload file
+mc cp myfile.csv minio/raw-data/
+
+# Remove file
+mc rm minio/raw-data/myfile.csv
+```
+
+---
+
+## Additional Resources
+
+- [Apache Airflow Docs](https://airflow.apache.org/)
+- [Apache Spark Docs](https://spark.apache.org/docs/latest/)
+- [MinIO Documentation](https://docs.min.io/)
+- [PaySim Dataset Paper](https://www.kaggle.com/datasets/ealaxi/paysim1)
+- [S3A Configuration Guide](https://hadoop.apache.org/docs/current/hadoop-aws/tools/hadoop-aws/index.html)
+
+---
+
+## Support & Contribution
+
+For issues, feature requests, or contributions:
+
+1. Check existing logs and troubleshooting guide
+2. Review docker-compose.yml and DAG files
+3. Consult service documentation (Airflow, Spark, MinIO)
+4. Open an issue with:
+   - Error logs (docker-compose logs)
+   - Steps to reproduce
+   - Environment details (.env, OS, Docker version)
+
+---
+
+**Last Updated**: November 24, 2025  
+**Project**: SIC Graduation - Big Data Fraud Detection  
+**Maintainer**: Development Team
